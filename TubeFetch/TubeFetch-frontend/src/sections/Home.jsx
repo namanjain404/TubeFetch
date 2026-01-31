@@ -43,7 +43,7 @@ const Home = ({ darkMode }) => {
     if (!url) return alert("Please enter a video URL");
     setLoading(true);
     try {
-      const response = await fetch("https://tubefetch-86ni.onrender.com/api/video-info", {
+      const response = await fetch("http://localhost:8080/api/video-info", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -79,7 +79,7 @@ const Home = ({ darkMode }) => {
     eventSource.onerror = () => eventSource.close();
 
     try {
-      const response = await fetch("https://tubefetch-86ni.onrender.com/api/download", {
+      const response = await fetch("http://localhost:8080/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, format, title: videoData?.title }),

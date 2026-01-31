@@ -23,7 +23,7 @@ import jakarta.servlet.http.HttpServletResponse;
 
 @RestController
 @RequestMapping("/api")
-@CrossOrigin(origins = "https://tubefetch-86ni.onrender.com")
+@CrossOrigin(origins = "http://localhost:5173/")
 public class DownloadController {
 
     private final DownloadService downloadService;
