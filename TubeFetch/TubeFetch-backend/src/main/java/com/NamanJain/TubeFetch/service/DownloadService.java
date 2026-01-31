@@ -43,8 +43,9 @@ public class DownloadService {
 		try (InputStream is = process.getInputStream()) {
 			fullInfo = mapper.readValue(is, Map.class);
 		} catch (Exception e) {
-			throw new RuntimeException("Failed to parse yt-dlp output.");
-		}
+		e.printStackTrace();
+		throw new RuntimeException("yt-dlp error: " + e.getMessage());
+	}
 
 		Map<String, Object> info = new HashMap<>();
 		info.put("title", fullInfo.get("title"));
