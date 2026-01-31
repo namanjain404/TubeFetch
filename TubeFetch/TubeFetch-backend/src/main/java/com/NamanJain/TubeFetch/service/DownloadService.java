@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -14,6 +15,7 @@ import java.util.regex.Pattern;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StreamUtils;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -22,9 +24,12 @@ public class DownloadService {
 
 	@Value("${yt-dlp.path}")
 	private String ytDlpPath;
-	
+
 	@Value("${ffmpeg.path}")
 	private String ffmpegPath;
+
+	// Common User-Agent to avoid immediate blocking
+	private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 	public String buildFilename(String title, String extension) {
 		String safeTitle = title.replaceAll("[\\\\/:*?\"<>|]", "_");
@@ -34,31 +39,55 @@ public class DownloadService {
 	@Cacheable(value = "videoInfo")
 	@SuppressWarnings("unchecked")
 	public Map<String, Object> getVideoInfo(String url) throws IOException, InterruptedException {
-		// Dump JSON info
-		Process process = new ProcessBuilder(ytDlpPath, "--dump-json", "--no-playlist", "--no-warnings", url).start();
+
+		// Use ProcessBuilder to capture both streams
+		ProcessBuilder pb = new ProcessBuilder(
+				ytDlpPath,
+				"--dump-json",
+				"--no-playlist",
+				"--no-warnings",
+				"--user-agent", USER_AGENT,
+				url
+		);
+
+		Process process = pb.start();
+
+		// Read Input Stream (Success data) and Error Stream (Failure data)
+		String output;
+		String error;
+		try (InputStream is = process.getInputStream(); InputStream es = process.getErrorStream()) {
+			output = StreamUtils.copyToString(is, StandardCharsets.UTF_8);
+			error = StreamUtils.copyToString(es, StandardCharsets.UTF_8);
+		}
+
+		int exitCode = process.waitFor();
+
+		if (exitCode != 0 || output.isEmpty()) {
+			System.err.println("YT-DLP EXIT CODE: " + exitCode);
+			System.err.println("YT-DLP ERROR: " + error);
+			throw new RuntimeException("yt-dlp failed: " + (error.isEmpty() ? "No output" : error));
+		}
 
 		ObjectMapper mapper = new ObjectMapper();
 		Map<String, Object> fullInfo;
 
-		try (InputStream is = process.getInputStream()) {
-			fullInfo = mapper.readValue(is, Map.class);
+		try {
+			fullInfo = mapper.readValue(output, Map.class);
 		} catch (Exception e) {
-		e.printStackTrace();
-		throw new RuntimeException("yt-dlp error: " + e.getMessage());
-	}
+			System.err.println("JSON Parsing failed. Raw output: " + output);
+			throw new RuntimeException("Failed to parse yt-dlp JSON response.");
+		}
 
 		Map<String, Object> info = new HashMap<>();
 		info.put("title", fullInfo.get("title"));
 		info.put("thumbnail", fullInfo.get("thumbnail"));
 
-		// Duration Logic
 		Object durationObj = fullInfo.get("duration");
 		if (durationObj instanceof Number) {
 			int totalSeconds = ((Number) durationObj).intValue();
 			info.put("duration", String.format("%d:%02d", totalSeconds / 60, totalSeconds % 60));
 		}
 
-		// --- IMPROVED FORMAT FILTERING ---
 		List<Map<String, Object>> allFormats = (List<Map<String, Object>>) fullInfo.get("formats");
 		List<Map<String, Object>> filteredFormats = new ArrayList<>();
 		Set<Integer> seenHeights = new HashSet<>();
@@ -67,17 +96,14 @@ public class DownloadService {
 			for (Map<String, Object> f : allFormats) {
 				Object heightObj = f.get("height");
 				Object vcodec = f.get("vcodec");
-				
-				// Ensure it is a video stream (vcodec != 'none')
+
 				if (heightObj != null && vcodec != null && !vcodec.equals("none")) {
 					int h = ((Number) heightObj).intValue();
-
-					// Look for standard qualities. Note: We DO NOT filter by 'ext' here!
 					if ((h == 360 || h == 720 || h == 1080) && !seenHeights.contains(h)) {
 						Map<String, Object> cleanFormat = new HashMap<>();
 						cleanFormat.put("formatId", f.get("format_id"));
 						cleanFormat.put("quality", h + "p");
-						cleanFormat.put("ext", "mp4"); // We tell frontend it WILL be mp4 after merging
+						cleanFormat.put("ext", "mp4");
 						filteredFormats.add(cleanFormat);
 						seenHeights.add(h);
 					}
@@ -85,7 +111,6 @@ public class DownloadService {
 			}
 		}
 
-		// Sort by quality descending (1080p first)
 		filteredFormats.sort((a, b) -> {
 			int h1 = Integer.parseInt(((String) a.get("quality")).replace("p", ""));
 			int h2 = Integer.parseInt(((String) b.get("quality")).replace("p", ""));
@@ -105,55 +130,49 @@ public class DownloadService {
 	}
 
 	public Path downloadToTempFile(String url, String formatId, Consumer<String> progressListener) throws IOException, InterruptedException {
-	    Path tempDir = Files.createTempDirectory("tubefetch_" + UUID.randomUUID());
-	    String outputTemplate = tempDir.toAbsolutePath().toString() + "/video.%(ext)s";
+		Path tempDir = Files.createTempDirectory("tubefetch_" + UUID.randomUUID());
+		String outputTemplate = tempDir.toAbsolutePath().toString() + "/video.%(ext)s";
 
-	    // CRITICAL: We use formatId + bestaudio to ensure high quality video gets sound
-	    ProcessBuilder pb = new ProcessBuilder(
-	    	    ytDlpPath,
-	    	    "--ffmpeg-location", ffmpegPath,
-	    	    "--newline",
-	    	    "--progress",
-	    	    "--extractor-args", "youtube:player_client=android,web;player_skip=web",
-	    	    // This string says: "Try requested format + best audio, 
-	    	    // if that fails try best video + best audio, 
-	    	    // if that fails just get the best single file"
-	    	    "-f", formatId + "+bestaudio[ext=m4a]/bestvideo+bestaudio/best", 
-	    	    "--merge-output-format", "mp4", 
-	    	    "-o", outputTemplate,
-	    	    url
-	    	);
+		ProcessBuilder pb = new ProcessBuilder(
+				ytDlpPath,
+				"--ffmpeg-location", ffmpegPath,
+				"--newline",
+				"--progress",
+				"--user-agent", USER_AGENT,
+				"--extractor-args", "youtube:player_client=android,web;player_skip=web",
+				"-f", formatId + "+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+				"--merge-output-format", "mp4",
+				"-o", outputTemplate,
+				url
+		);
 
-	    pb.redirectErrorStream(true); 
-	    Process process = pb.start();
-	    
-	    Pattern percentPattern = Pattern.compile("\\[download\\]\\s+([\\d\\.]+)%");
+		pb.redirectErrorStream(true);
+		Process process = pb.start();
 
-	    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-	        String line;
-	        while ((line = reader.readLine()) != null) {
-	            System.out.println("YT-DLP LOG: " + line); 
-	            
-	            Matcher matcher = percentPattern.matcher(line);
-	            if (matcher.find()) {
-	                progressListener.accept(matcher.group(1));
-	            }
-	            
-	            // If it starts merging, jump progress to 99%
-	            if (line.toLowerCase().contains("merging")) {
-	                progressListener.accept("99.0");
-	            }
-	        }
-	    }
+		Pattern percentPattern = Pattern.compile("\\[download\\]\\s+([\\d\\.]+)%");
 
-	    int exitCode = process.waitFor();
-	    if (exitCode != 0) {
-	        throw new RuntimeException("yt-dlp failed with exit code " + exitCode);
-	    }
+		try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+			String line;
+			while ((line = reader.readLine()) != null) {
+				System.out.println("YT-DLP LOG: " + line);
+				Matcher matcher = percentPattern.matcher(line);
+				if (matcher.find()) {
+					progressListener.accept(matcher.group(1));
+				}
+				if (line.toLowerCase().contains("merging")) {
+					progressListener.accept("99.0");
+				}
+			}
+		}
 
-	    return Files.list(tempDir)
-	                .filter(p -> p.toString().endsWith(".mp4"))
-	                .findFirst()
-	                .orElseThrow(() -> new IOException("MP4 file not found in temp directory"));
+		int exitCode = process.waitFor();
+		if (exitCode != 0) {
+			throw new RuntimeException("yt-dlp download failed with exit code " + exitCode);
+		}
+
+		return Files.list(tempDir)
+				.filter(p -> p.toString().endsWith(".mp4"))
+				.findFirst()
+				.orElseThrow(() -> new IOException("MP4 file not found after download process completed."));
 	}
 }
