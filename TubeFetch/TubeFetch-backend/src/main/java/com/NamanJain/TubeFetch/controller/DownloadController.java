@@ -23,7 +23,7 @@ import jakarta.servlet.http.HttpServletResponse;
 
 @RestController
 @RequestMapping("/api")
-@CrossOrigin(origins = "http://localhost:5173/")
+@CrossOrigin(origins = "https://tubefetch-yt.netlify.app/")
 public class DownloadController {
 
     private final DownloadService downloadService;
